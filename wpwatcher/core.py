@@ -39,15 +39,15 @@ class WPWatcher():
         # Init DB interface
         self.wp_reports=WPWatcherDataBase(conf['wp_reports'])
 
+        # Dump config
+        conf.update({'wp_reports':self.wp_reports.filepath})
+        log.debug("WPWatcher configuration:{}".format(self.dump_config(conf)))
+
         # Init scanner
         self.scanner=WPWatcherScanner(conf)
 
         # Save sites
         self.wp_sites=conf['wp_sites']
-
-        # Dump config
-        conf.update({'wp_reports':self.wp_reports.filepath})
-        log.debug("WPWatcher configuration:{}".format(self.dump_config(conf)))
 
         # Asynchronous executor
         self.executor=concurrent.futures.ThreadPoolExecutor(max_workers=conf['asynch_workers'])
@@ -91,16 +91,20 @@ class WPWatcher():
             else: v=str(v)
             string+=("\n{:<25}\t=\t{}".format(k,v))
         return(string)
-    
-    def wait_all_wpscan_process(self):
-        
-        while len(self.scanner.wpscan.processes)>0:
-            time.sleep(0.05)
 
     def tear_down_jobs(self):
         # Cancel all jobs
         for f in self.futures:
             if not f.done(): f.cancel()
+
+    def terminate_scan(self, ):
+        # Kill process if still alive
+        for p in self.wpscan.processes:
+            if ( wp_site['url'] in p.args ) and not p.returncode:
+                log.info('Killing WPScan process %s'%(safe_log_wpscan_args(p.args)))
+                p.kill()
+        # Discard wpscan_output from report
+        if 'wpscan_output' in wp_report: del wp_report['wpscan_output']
         
     
     def interrupt(self, sig=None, frame=None):
@@ -147,12 +151,12 @@ class WPWatcher():
        
         return wp_site
 
-    # Orchestrate the scanning of a site
-    def scan_site_wrapper(self, wp_site, with_api_token=False):
+    # Thw scan_site wrapper find the last report, run the scan and update DB with result if any
+    # Will be executed asynchronously
+    def scan_site_wrapper(self, wp_site):
         
         wp_site=self.format_site(wp_site)
         last_wp_report=self.wp_reports.find_last_wp_report({'site':wp_site['url']})
-        if with_api_token: wp_site['wpscan_args'].extend([ "--api-token", self.scanner.api_token ])
 
         # Launch scanner
         wp_report= self.scanner.scan_site(wp_site,  last_wp_report, timeout_seconds=self.scan_timeout.total_seconds())
@@ -163,10 +167,10 @@ class WPWatcher():
         print_progress_bar(len(self.scanner.scanned_sites), len(self.wp_sites))     
         return(wp_report)
 
-    def run_scans_wrapper(self, wp_sites, **kwargs):
+    def run_scans_wrapper(self, wp_sites):
         log.info("Starting scans on %s configured sites"%(len(wp_sites)))
         for wp_site in wp_sites:
-            self.futures.append(self.executor.submit(self.scan_site_wrapper, wp_site, **kwargs))
+            self.futures.append(self.executor.submit(self.scan_site_wrapper, wp_site))
         for f in self.futures:
             try: self.new_reports.append(f.result())
             # Handle interruption from inside threads when using --ff
@@ -190,9 +194,10 @@ class WPWatcher():
         self.print_scanned_sites_results(new_reports)
 
         # Second scans if needed
-        if len(self.scanner.prescanned_sites_warn)>0:
-            new_reports+=self.re_run_scans(self.scanner.prescanned_sites_warn)
-            self.print_scanned_sites_results(new_reports)
+        if len(self.scanner.prescanned_sites_warnings)>0:
+            rescan_reports=self.re_run_scans_with_api_token(self.scanner.prescanned_sites_warnings)
+            self.print_scanned_sites_results(rescan_reports)
+            new_reports+=rescan_reports
 
         if not any ([r['status']=='ERROR' for r in new_reports if r]):
             log.info("Scans finished successfully.")
@@ -201,9 +206,10 @@ class WPWatcher():
             log.info("Scans finished with errors.") 
             return((-1, new_reports))
 
-    def re_run_scans(self, wp_sites):
+    def re_run_scans_with_api_token(self, wp_sites):
         self.scanner.scanned_sites=[]
         self.futures=[]
         self.wp_sites=wp_sites
-        return self.run_scans_wrapper(wp_sites, with_api_token=True)
+        for wp_site in wp_sites: wp_site['wpscan_args'].extend([ "--api-token", self.scanner.api_token ])
+        return self.run_scans_wrapper(wp_sites)
         

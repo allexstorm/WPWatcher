@@ -1,7 +1,7 @@
 #! /usr/bin/env python3
 from setuptools import setup
 import sys
-if sys.version_info[0] < 3: raise Exception("Sorry, you must use Python 3, please install Python on your system")
+if sys.version_info[0] < 3: raise Exception("Sorry, you must use Python 3")
 # Helper method that will parse wpwatcher.py to extract config setup values
 def parse_setup(key):
     part={}

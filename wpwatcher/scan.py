@@ -9,6 +9,8 @@ import re
 import os
 import time
 import signal
+import copy
+import shlex
 import traceback
 import multiprocessing
 import multiprocessing.pool
@@ -29,10 +31,24 @@ INTERRUPT_TIMEOUT=10
 # Date format used everywhere
 DATE_FORMAT='%Y-%m-%dT%H-%M-%S'
 
+# Reports fields definitions
+DEFAULT_REPORT={
+            "site":"",
+            "status":None,
+            "datetime": None,
+            "last_email":None,
+            "errors":[],
+            "infos":[],
+            "warnings":[],
+            "alerts":[],
+            "fixed":[],
+            "wpscan_output":""
+        }
+
 class WPWatcherScanner():
     
     def __init__(self, conf):
-        # self.conf=conf
+        self.conf=conf
 
         # Create (lazy) wpscan link
         self.wpscan=WPScanWrapper(conf['wpscan_path'])
@@ -45,20 +61,11 @@ class WPWatcherScanner():
         self.interrupting=False 
         # List of urls scanend
         self.scanned_sites=[]
-       
-        # Save required config options
-        self.api_limit_wait=conf['api_limit_wait']
-        self.follow_redirect=conf['follow_redirect']
-        self.wpscan_output_folder=conf['wpscan_output_folder']
-        self.wpscan_args=conf['wpscan_args']
-        self.fail_fast=conf['fail_fast']
-        self.false_positive_strings=conf['false_positive_strings']
-        self.daemon=conf['daemon']
-        self.daemon_loop_sleep=conf['daemon_loop_sleep']
+        
         self.prescan_without_api_token=conf['prescan_without_api_token']
 
         # Setup prescan options
-        self.prescanned_sites_warn=[]
+        self.prescanned_sites_warnings=[]
         self.api_token=None
         if self.prescan_without_api_token:
             log.info("Prescan without API token...")
@@ -103,7 +110,92 @@ class WPWatcherScanner():
             return None
         api_token_index = wpscan_args.index("--api-token")+1
         token = wpscan_args[api_token_index]
-        return token
+        return token   
+
+    def cancel_scans(self):
+        self.interrupting=True
+        # Send ^C to all WPScan not finished
+        for p in self.wpscan.processes: p.send_signal(signal.SIGINT)
+        # Wait for all processes to finish , kill after timeout
+        try: timeout(INTERRUPT_TIMEOUT, self.wait_all_wpscan_process)
+        except TimeoutError:
+            log.error("Interrupt timeout reached, killing WPScan processes")
+            for p in self.wpscan.processes: p.kill()
+        # Unlock api wait
+        self.api_wait.set()
+
+    def wait_all_wpscan_process(self):
+        while len(self.wpscan.processes)>0:
+            time.sleep(0.05)
+
+    #################################################################
+    # Scan process
+
+    # Init report and scan site timeout wrapper
+    def scan_site(self, wp_site, last_wp_report=None, timeout_seconds=300):
+        # Init Scan object
+        scan=Scan(self.conf, wp_site, last_wp_report)
+        return scan.run(timeout_seconds)
+
+class Scan():
+    def __init__(self, conf, wp_site, last_wp_report):
+        self.wp_site=wp_site
+        self.last_wp_report=last_wp_report
+        self.process=None
+
+         # Save required config options
+        self.wpscan_args=[]
+        [ self.wpscan_args.extend(shlex.split(arg)) for arg in conf['wpscan_args'] ]
+        self.api_limit_wait=conf['api_limit_wait']
+        self.follow_redirect=conf['follow_redirect']
+        self.wpscan_output_folder=conf['wpscan_output_folder']
+        self.fail_fast=conf['fail_fast']
+        self.false_positive_strings=conf['false_positive_strings']
+        self.daemon=conf['daemon']
+        self.daemon_loop_sleep=conf['daemon_loop_sleep']
+        
+        # Init report variables: site URL and datetime
+        self.wp_report=copy.deepcopy(DEFAULT_REPORT).update({"site":wp_site['url'], "datetime": datetime.now().strftime(DATE_FORMAT),})
+
+    def run(self, timeout_seconds):
+        # Wait until process finishes
+        try: self.wp_report.update(timeout(timeout_seconds, self._scan_site))
+        except TimeoutError:
+            self.wp_report['status']='ERROR'
+            self.wp_report['errors'].append("Timeout scanning site after %s seconds"%timeout_seconds)
+            log.error("Timeout scanning site %s after %s seconds."%(self.wp_site['url'], timeout_seconds))
+            # Terminate
+            self.terminate_scan()
+            self.check_fail_fast()
+        return self.wp_report
+    
+    def skip_this_site(self, wp_report, last_wp_report):
+        # Skip if the daemon mode is enabled and scan already happend in the last configured `daemon_loop_wait`
+        if ( self.daemon and 
+            datetime.strptime(wp_report['datetime'],DATE_FORMAT) - datetime.strptime(last_wp_report['datetime'],DATE_FORMAT) < self.daemon_loop_sleep):
+            log.info("Daemon skipping site %s because already scanned in the last %s"%(wp_report['site'] , self.daemon_loop_sleep))
+            self.scanned_sites.append(None)
+            return True
+        return False    
+
+    def write_wpscan_output(self, wp_report):
+        # Subfolder
+        folder="%s/"%wp_report['status'].lower() if wp_report['status']!='FIXED' else 'info/'
+        # Write wpscan output 
+        wpscan_results_file=None
+        if self.wpscan_output_folder :
+            wpscan_results_file=os.path.join(self.wpscan_output_folder, folder , 
+                get_valid_filename('WPScan_output_%s_%s.txt' % (wp_report['site'], wp_report['datetime'])))
+            with open(wpscan_results_file, 'w') as wpout:
+                wpout.write(re.sub(r'(\x1b|\[[0-9][0-9]?m)','', str(wp_report['wpscan_output'])))
+        return(wpscan_results_file)
+
+    def check_fail_fast(self):
+        # Fail fast
+        if self.fail_fast and not self.interrupting: 
+            log.error("Failure")
+            raise InterruptedError()
+        return None # Interrupt will generate other errors
 
     @staticmethod
     def get_fixed_issues(wp_report, last_wp_report, issue_type='alerts'):
@@ -125,77 +217,23 @@ class WPWatcherScanner():
             # Save last email datetime if any
             if last_wp_report['last_email']:
                 wp_report['last_email']=last_wp_report['last_email']
-    
-    def write_wpscan_output(self, wp_report):
-        # Subfolder
-        folder="%s/"%wp_report['status'].lower() if wp_report['status']!='FIXED' else 'info/'
-        # Write wpscan output 
-        wpscan_results_file=None
-        if self.wpscan_output_folder :
-            wpscan_results_file=os.path.join(self.wpscan_output_folder, folder , 
-                get_valid_filename('WPScan_output_%s_%s.txt' % (wp_report['site'], wp_report['datetime'])))
-            with open(wpscan_results_file, 'w') as wpout:
-                wpout.write(re.sub(r'(\x1b|\[[0-9][0-9]?m)','', str(wp_report['wpscan_output'])))
-        return(wpscan_results_file)
 
-    def check_fail_fast(self):
-        # Fail fast
-        if self.fail_fast and not self.interrupting: 
-            log.error("Failure")
-            raise InterruptedError()
-        return None # Interrupt will generate other errors
-
-    def skip_this_site(self, wp_report, last_wp_report):
-        # Skip if the daemon mode is enabled and scan already happend in the last configured `daemon_loop_wait`
-        if ( self.daemon and 
-            datetime.strptime(wp_report['datetime'],DATE_FORMAT) - datetime.strptime(last_wp_report['datetime'],DATE_FORMAT) < self.daemon_loop_sleep):
-            log.info("Daemon skipping site %s because already scanned in the last %s"%(wp_report['site'] , self.daemon_loop_sleep))
-            self.scanned_sites.append(None)
-            return True
-        return False
-
-    def log_report_results(self, wp_report):
-         # Print WPScan findings ------------------------------------------------------
+    @staticmethod
+    def log_report_results(wp_report):
+        # Print WPScan findings ------------------------------------------------------
         for info in wp_report['infos']: log.info(oneline("** WPScan INFO %s ** %s" % (wp_report['site'], info )))
         for fix in wp_report['fixed']: log.info(oneline("** FIXED %s ** %s" % (wp_report['site'], fix )))
         for warning in wp_report['warnings']: log.warning(oneline("** WPScan WARNING %s ** %s" % (wp_report['site'], warning )))
         for alert in wp_report['alerts']: log.critical(oneline("** WPScan ALERT %s ** %s" % (wp_report['site'], alert )))
 
-    def fill_report_status(self, wp_report):
+    @staticmethod
+    def fill_report_status(wp_report):
         # Report status ------------------------------------------------
         if len(wp_report['errors'])>0:wp_report['status']="ERROR"
         elif len(wp_report['warnings'])>0 and len(wp_report['alerts']) == 0: wp_report['status']='WARNING'
         elif len(wp_report['alerts'])>0: wp_report['status']='ALERT'
         elif len(wp_report['fixed'])>0: wp_report['status']='FIXED'
         else: wp_report['status']='INFO'
-    
-
-    def cancel_scans(self):
-        self.interrupting=True
-        # Send ^C to all WPScan not finished
-        for p in self.wpscan.processes: p.send_signal(signal.SIGINT)
-        # Wait for all processes to finish , kill after timeout
-        try: timeout(INTERRUPT_TIMEOUT, self.wait_all_wpscan_process)
-        except TimeoutError:
-            log.error("Interrupt timeout reached, killing WPScan processes")
-            for p in self.wpscan.processes: p.kill()
-        # Unlock api wait
-        self.api_wait.set()
-
-    def wait_all_wpscan_process(self):
-        while len(self.wpscan.processes)>0:
-            time.sleep(0.05)
-
-    def terminate_scan(self, wp_site, wp_report):
-        # Kill process if stilla live
-        for p in self.wpscan.processes:
-            if ( wp_site['url'] in p.args ) and not p.returncode:
-                log.info('Killing WPScan process %s'%(safe_log_wpscan_args(p.args)))
-                p.kill()
-        # Discard wpscan_output from report
-        if 'wpscan_output' in wp_report: del wp_report['wpscan_output']
-
-    # Scan process
 
     def handle_wpscan_err_api_wait(self,wp_site, wp_report):
         log.info("API limit has been reached after %s sites, sleeping %s and continuing the scans..."%(len(self.scanned_sites),API_WAIT_SLEEP))
@@ -273,7 +311,7 @@ class WPWatcherScanner():
             if wp_report_new: wp_report.update(wp_report_new)
             else : return None
         except RuntimeError:
-             # Try to handle error and return, Reccursive call to wpscan_site
+            # Try to handle error and return, Reccursive call to wpscan_site
             wp_report_new, handled = self.handle_wpscan_err(wp_site, wp_report)
             if handled and wp_report_new: wp_report.update(wp_report_new)
             if handled: return wp_report
@@ -297,9 +335,10 @@ class WPWatcherScanner():
 
         # Prescan handling
         if self.prescan_without_api_token and not self.retreive_api_token(wp_site['wpscan_args']) and wp_report['status'] in ['WARNING','ALERT']:
-            self.prescanned_sites_warn.append(wp_site)
+            self.prescanned_sites_warnings.append(wp_site)
             log.warning("Site %s triggered prescan warning, it will be scanned with API token at the end"%(wp_site['url']))
-            return None
+            # self.scanned_sites.append(wp_site['url'])
+            return(wp_report)
 
         self.log_report_results(wp_report)
         
@@ -324,31 +363,5 @@ class WPWatcherScanner():
 
         return(wp_report)
 
-        # timeout wrapper
-    def scan_site(self, wp_site, last_wp_report=None, timeout_seconds=300):
-        
-        # Init report variables
-        wp_report={
-            "site":wp_site['url'],
-            "status":None,
-            "datetime": datetime.now().strftime(DATE_FORMAT),
-            "last_email":None,
-            "errors":[],
-            "infos":[],
-            "warnings":[],
-            "alerts":[],
-            "fixed":[],
-            "wpscan_output":"" # will be deleted
-        }
 
-        # Wait until process finishes
-        try: wp_report = timeout(timeout_seconds, self._scan_site, args=(wp_site, wp_report, last_wp_report))
-        except TimeoutError:
-            wp_report['status']='ERROR'
-            wp_report['errors'].append("Timeout scanning site after %s seconds"%timeout)
-            log.error("Timeout scanning site %s after %s seconds."%(wp_site['url'], timeout_seconds))
-            # Terminate
-            self.terminate_scan(wp_site, wp_report)
-            self.check_fail_fast()
 
-        return wp_report
